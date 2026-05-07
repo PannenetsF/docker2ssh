@@ -725,9 +725,18 @@ async fn run_attached_process_with_pty(
     let status = child.wait().await?;
     stdin_task.abort();
     let _ = stdin_task.await;
-    stdout_task
-        .await
-        .context("pty stdout task join failed")??;
+    let mut stdout_task = stdout_task;
+    match tokio::time::timeout(Duration::from_millis(200), &mut stdout_task).await {
+        Ok(joined) => {
+            joined.context("pty stdout task join failed")??;
+        }
+        Err(_) => {
+            // PTY readers do not always observe EOF promptly after the slave exits.
+            // Once the shell process is gone, force session teardown instead of hanging.
+            stdout_task.abort();
+            let _ = stdout_task.await;
+        }
+    }
     let code = status.code().unwrap_or(255).max(0) as u32;
 
     // #region debug-point A:pty-exit
