@@ -6,14 +6,17 @@ use russh::keys::{self, PrivateKey, PrivateKeyWithHashAlg, PublicKey};
 use russh::keys::ssh_key::LineEnding;
 use russh::server::{self, Auth, Msg, Server as _, Session};
 use russh::{Channel, ChannelId};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::env;
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 use tokio::process::Command;
 
 pub struct ServeManager {
@@ -40,24 +43,28 @@ impl ServeManager {
 
         let mut handles = Vec::new();
         for mapping in cfg.mappings {
-            let listen_addr = format!("{}:{}", cfg.listen_host, mapping.port);
+            let port = mapping.port;
             let server = PortServer::new(mapping, self.docker.clone(), authz.clone());
-            let mut task_server = server.clone();
-            let server_config = Arc::new(server::Config {
-                inactivity_timeout: Some(Duration::from_secs(3600)),
-                auth_rejection_time: Duration::from_secs(1),
-                auth_rejection_time_initial: Some(Duration::from_secs(0)),
-                keys: vec![host_key.clone()],
-                ..Default::default()
-            });
+            let listeners = build_listeners(&cfg.listen_host, port)?;
 
-            println!("listening on {listen_addr} -> {}", server.mapping.container);
-            handles.push(tokio::spawn(async move {
-                task_server
-                    .run_on_address(server_config, listen_addr)
-                    .await
-                    .map_err(anyhow::Error::from)
-            }));
+            for (listen_label, listener) in listeners {
+                let mut task_server = server.clone();
+                let server_config = Arc::new(server::Config {
+                    inactivity_timeout: Some(Duration::from_secs(3600)),
+                    auth_rejection_time: Duration::from_secs(1),
+                    auth_rejection_time_initial: Some(Duration::from_secs(0)),
+                    keys: vec![host_key.clone()],
+                    ..Default::default()
+                });
+
+                println!("listening on {listen_label} -> {}", server.mapping.container);
+                handles.push(tokio::spawn(async move {
+                    task_server
+                        .run_on_socket(server_config, &listener)
+                        .await
+                        .map_err(anyhow::Error::from)
+                }));
+            }
         }
 
         tokio::signal::ctrl_c().await?;
@@ -66,6 +73,76 @@ impl ServeManager {
         }
         Ok(())
     }
+}
+
+fn build_listeners(listen_host: &str, port: u16) -> anyhow::Result<Vec<(String, TcpListener)>> {
+    let normalized = normalize_listen_host(listen_host);
+    if is_dual_stack_wildcard(&normalized) {
+        return Ok(vec![
+            (
+                format!("0.0.0.0:{port}"),
+                bind_v4(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port))?,
+            ),
+            (
+                format!("[::]:{port}"),
+                bind_v6(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port))?,
+            ),
+        ]);
+    }
+
+    let ip = normalized
+        .parse::<IpAddr>()
+        .with_context(|| format!("invalid listen_host: {listen_host}"))?;
+    let listener = match ip {
+        IpAddr::V4(v4) => bind_v4(SocketAddr::new(IpAddr::V4(v4), port))?,
+        IpAddr::V6(v6) => bind_v6(SocketAddr::new(IpAddr::V6(v6), port))?,
+    };
+    Ok(vec![(display_socket_addr(&SocketAddr::new(ip, port)), listener)])
+}
+
+fn normalize_listen_host(listen_host: &str) -> String {
+    listen_host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string()
+}
+
+fn is_dual_stack_wildcard(listen_host: &str) -> bool {
+    matches!(listen_host, "0.0.0.0" | "::")
+}
+
+fn display_socket_addr(addr: &SocketAddr) -> String {
+    match addr {
+        SocketAddr::V4(_) => addr.to_string(),
+        SocketAddr::V6(_) => format!("[{}]:{}", addr.ip(), addr.port()),
+    }
+}
+
+fn bind_v4(addr: SocketAddr) -> anyhow::Result<TcpListener> {
+    bind_socket(addr, false)
+}
+
+fn bind_v6(addr: SocketAddr) -> anyhow::Result<TcpListener> {
+    bind_socket(addr, true)
+}
+
+fn bind_socket(addr: SocketAddr, v6_only: bool) -> anyhow::Result<TcpListener> {
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    if matches!(domain, Domain::IPV6) {
+        socket.set_only_v6(v6_only)?;
+    }
+    socket.bind(&addr.into())?;
+    socket.listen(128)?;
+    let listener: std::net::TcpListener = socket.into();
+    listener.set_nonblocking(true)?;
+    Ok(TcpListener::from_std(listener)?)
 }
 
 #[derive(Clone)]
@@ -719,6 +796,24 @@ exit 4
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn wildcard_listen_host_creates_dual_stack_listeners() {
+        let listeners = build_listeners("0.0.0.0", 0).unwrap();
+        assert_eq!(listeners.len(), 2);
+        assert_eq!(listeners[0].0, "0.0.0.0:0");
+        assert_eq!(listeners[1].0, "[::]:0");
+        assert!(listeners[0].1.local_addr().unwrap().is_ipv4());
+        assert!(listeners[1].1.local_addr().unwrap().is_ipv6());
+    }
+
+    #[tokio::test]
+    async fn bracketed_ipv6_listen_host_is_supported() {
+        let listeners = build_listeners("[::1]", 0).unwrap();
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].0, "[::1]:0");
+        assert!(listeners[0].1.local_addr().unwrap().is_ipv6());
     }
 
     #[tokio::test]
