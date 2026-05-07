@@ -34,6 +34,8 @@ pub struct ContainerInspect {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ContainerState {
+    #[serde(rename = "Pid")]
+    pub pid: u32,
     #[serde(rename = "Running")]
     pub running: bool,
 }
@@ -87,6 +89,17 @@ impl DockerBackend {
             }
         }
         Ok(out)
+    }
+
+    pub async fn running_container_pid(&self, name_or_id: &str) -> anyhow::Result<u32> {
+        let inspect = self.inspect_container(name_or_id).await?;
+        if !inspect.state.running {
+            bail!("container is not running");
+        }
+        if inspect.state.pid == 0 {
+            bail!("container has no running process");
+        }
+        Ok(inspect.state.pid)
     }
 
     pub(crate) async fn request<B>(&self, req: Request<B>) -> anyhow::Result<Response<Incoming>>

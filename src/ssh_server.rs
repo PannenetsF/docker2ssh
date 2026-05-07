@@ -23,6 +23,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 
+#[cfg(target_os = "linux")]
+use nix::sched::{CloneFlags, setns};
+#[cfg(target_os = "linux")]
+use std::net::ToSocketAddrs;
+
 pub struct ServeManager {
     store: ConfigStore,
     docker: DockerBackend,
@@ -305,6 +310,44 @@ impl server::Handler for PortHandler {
         Ok(true)
     }
 
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        originator_address: &str,
+        originator_port: u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        let Ok(port) = u16::try_from(port_to_connect) else {
+            return Ok(false);
+        };
+        let mapping = self.mapping.clone();
+        let docker = self.docker.clone();
+        let host = host_to_connect.to_string();
+        let originator_address = originator_address.to_string();
+        match connect_direct_tcpip_target(docker, &mapping.container, &host, port).await {
+            Ok(stream) => {
+                tokio::spawn(async move {
+                    if let Err(err) = bridge_direct_tcpip(channel, stream).await {
+                        eprintln!(
+                            "direct-tcpip bridge failed for {}:{} from {}:{}: {err:#}",
+                            host, port, originator_address, originator_port
+                        );
+                    }
+                });
+                Ok(true)
+            }
+            Err(err) => {
+                eprintln!(
+                    "direct-tcpip rejected for {}:{} from {}:{}: {err:#}",
+                    host_to_connect, port_to_connect, originator_address, originator_port
+                );
+                Ok(false)
+            }
+        }
+    }
+
     async fn pty_request(
         &mut self,
         channel: ChannelId,
@@ -475,6 +518,89 @@ async fn spawn_container_exec(
     ));
     // #endregion
     run_attached_process(channel, cmd, pty).await
+}
+
+async fn connect_direct_tcpip_target(
+    docker: DockerBackend,
+    container_ref: &str,
+    host: &str,
+    port: u16,
+) -> anyhow::Result<TcpStream> {
+    let pid = docker.running_container_pid(container_ref).await?;
+    let host = normalize_forward_host(host).to_string();
+    let std_stream = tokio::task::spawn_blocking(move || connect_in_network_namespace(pid, &host, port))
+        .await
+        .context("failed to join direct-tcpip connector task")??;
+    std_stream.set_nonblocking(true)?;
+    std_stream.set_nodelay(true)?;
+    Ok(TcpStream::from_std(std_stream)?)
+}
+
+fn normalize_forward_host(host: &str) -> &str {
+    match host {
+        "" => "127.0.0.1",
+        _ => host,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn connect_in_network_namespace(
+    pid: u32,
+    host: &str,
+    port: u16,
+) -> anyhow::Result<std::net::TcpStream> {
+    let current_ns =
+        std::fs::File::open("/proc/self/ns/net").context("failed to open current network namespace")?;
+    let target_path = format!("/proc/{pid}/ns/net");
+    let target_ns = std::fs::File::open(&target_path)
+        .with_context(|| format!("failed to open target network namespace: {target_path}"))?;
+
+    setns(&target_ns, CloneFlags::CLONE_NEWNET).context("failed to enter container network namespace")?;
+    let connect_res = connect_blocking(host, port);
+    let restore_res =
+        setns(&current_ns, CloneFlags::CLONE_NEWNET).context("failed to restore original network namespace");
+
+    match (connect_res, restore_res) {
+        (Ok(stream), Ok(())) => Ok(stream),
+        (Err(err), Ok(())) => Err(err),
+        (Ok(_), Err(err)) => Err(err),
+        (Err(connect_err), Err(restore_err)) => Err(connect_err.context(restore_err.to_string())),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn connect_in_network_namespace(
+    _pid: u32,
+    _host: &str,
+    _port: u16,
+) -> anyhow::Result<std::net::TcpStream> {
+    bail!("direct-tcpip via container network namespace is only supported on Linux")
+}
+
+#[cfg(target_os = "linux")]
+fn connect_blocking(host: &str, port: u16) -> anyhow::Result<std::net::TcpStream> {
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("failed to resolve {host}:{port}"))?;
+    let mut last_err = None;
+    for addr in addrs {
+        match std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    match last_err {
+        Some(err) => Err(err).with_context(|| format!("failed to connect to {host}:{port}")),
+        None => bail!("no socket addresses resolved for {host}:{port}"),
+    }
+}
+
+async fn bridge_direct_tcpip(channel: Channel<Msg>, mut upstream: TcpStream) -> anyhow::Result<()> {
+    let mut stream = channel.into_stream();
+    let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await?;
+    let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
+    let _ = tokio::io::AsyncWriteExt::shutdown(&mut upstream).await;
+    Ok(())
 }
 
 async fn resolve_container_shell(mapping: &MappingSpec) -> anyhow::Result<String> {
@@ -1064,7 +1190,7 @@ exit 4
                     let path = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
                     let body = if path == "/containers/my-container/json" {
                         Bytes::from_static(
-                            br#"{"Id":"abc123def456","Name":"/my-container","State":{"Running":true}}"#,
+                            br#"{"Id":"abc123def456","Name":"/my-container","State":{"Running":true,"Pid":12345}}"#,
                         )
                     } else {
                         Bytes::from_static(b"OK")
@@ -1116,6 +1242,77 @@ exit 4
         )
         .await
         .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn direct_tcpip_reaches_container_network_namespace() {
+        let target_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let target_port = target_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = target_listener.accept().await.unwrap();
+            socket.write_all(b"forward-ok").await.unwrap();
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let docker_sock = tmp.path().join("docker.sock");
+        let unix_listener = UnixListener::bind(&docker_sock).unwrap();
+        let pid = std::process::id();
+
+        tokio::spawn(async move {
+            let (stream, _) = unix_listener.accept().await.unwrap();
+            let service = service_fn(move |req: Request<hyper::body::Incoming>| async move {
+                let path = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+                let body = if path == "/containers/my-container/json" {
+                    Bytes::from(format!(
+                        "{{\"Id\":\"abc123def456\",\"Name\":\"/my-container\",\"State\":{{\"Running\":true,\"Pid\":{pid}}}}}"
+                    ))
+                } else {
+                    Bytes::from_static(b"OK")
+                };
+                Ok::<_, std::convert::Infallible>(Response::new(Full::new(body)))
+            });
+            let _ = http1::Builder::new()
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                .await;
+        });
+
+        let addr = TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap();
+        let host_key = PrivateKey::random(&mut rand::rng(), keys::Algorithm::Ed25519).unwrap();
+        let authz = Arc::new(Authz {
+            insecure_allow_none: true,
+            allowed_keys: HashSet::new(),
+        });
+        let server = PortServer::new(
+            MappingSpec {
+                port: addr.port(),
+                container: "my-container".to_string(),
+                shell: None,
+            },
+            DockerBackend::from_socket_path(docker_sock.clone()),
+            authz,
+        );
+        let mut task_server = server.clone();
+        let server_cfg = Arc::new(server::Config {
+            auth_rejection_time: Duration::from_secs(1),
+            auth_rejection_time_initial: Some(Duration::from_secs(0)),
+            keys: vec![host_key],
+            ..Default::default()
+        });
+        tokio::spawn(async move {
+            task_server.run_on_address(server_cfg, addr).await.unwrap();
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let session = connect_test_client(addr).await;
+        let channel = session
+            .channel_open_direct_tcpip("127.0.0.1", target_port.into(), "127.0.0.1", 60142)
+            .await
+            .unwrap();
+        let mut stream = channel.into_stream();
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&out), "forward-ok");
     }
 
     #[tokio::test]
