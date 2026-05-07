@@ -6,10 +6,20 @@ from pathlib import Path
 from typing import Any, Dict
 
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
+from hatchling.metadata.plugin.interface import MetadataHookInterface
 
 
 def _default_platform_tag() -> str:
     return sysconfig.get_platform().replace("-", "_").replace(".", "_")
+
+
+def _default_version() -> str:
+    return os.environ.get("D2S_PACKAGE_VERSION", "0.0.0")
+
+
+class CustomMetadataHook(MetadataHookInterface):
+    def update(self, metadata: Dict[str, Any]) -> None:
+        metadata["version"] = _default_version()
 
 
 class CustomBuildHook(BuildHookInterface):
@@ -26,3 +36,11 @@ class CustomBuildHook(BuildHookInterface):
             "D2S_WHEEL_TAG",
             f"py3-none-{os.environ.get('D2S_WHEEL_PLATFORM_TAG', _default_platform_tag())}",
         )
+
+
+def get_metadata_hook():
+    return CustomMetadataHook
+
+
+def get_build_hook():
+    return CustomBuildHook

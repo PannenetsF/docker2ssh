@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "docker2ssh"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Precompiled Python wheel for the d2s docker2ssh binary"
 readme = "README.md"
 requires-python = ">=3.7"
@@ -39,5 +39,7 @@ docker2ssh = "docker2ssh.cli:main"
 packages = ["src/docker2ssh"]
 artifacts = ["src/docker2ssh/bin/d2s"]
 pure-python = false
+
+[tool.hatch.metadata.hooks.custom]
 
 [tool.hatch.build.targets.wheel.hooks.custom]

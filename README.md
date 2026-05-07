@@ -216,6 +216,7 @@ Notes:
 
 - The wheel metadata is emitted as `py3-none-<platform>`
 - CI builds Linux `x86_64` and `aarch64` wheels in `.github/workflows/python-wheels.yml`
+- Tag `vX.Y.Z` publishes package version `X.Y.Z`; if that version already exists on PyPI, CI automatically uses `X.Y.Z.postN`
 - No source distribution is required for installs from published wheels
 - `D2S_BIN` still overrides the bundled binary when you want to use another `d2s`
 

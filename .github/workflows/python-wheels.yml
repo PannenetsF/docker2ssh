@@ -2,12 +2,61 @@ name: Python Wheels
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, e.g. 0.0.1"
+        required: true
   push:
     tags:
       - "v*"
 
 jobs:
+  resolve-version:
+    runs-on: ubuntu-24.04
+    outputs:
+      package_version: ${{ steps.resolve.outputs.package_version }}
+    steps:
+      - name: Resolve package version
+        id: resolve
+        env:
+          RAW_VERSION: ${{ github.event.inputs.version || github.ref_name }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          import re
+          import urllib.error
+          import urllib.request
+
+          package_name = "docker2ssh"
+          raw = os.environ["RAW_VERSION"].strip()
+          base = raw[1:] if raw.startswith("v") else raw
+
+          if not re.match(r"^\d+\.\d+\.\d+$", base):
+              raise SystemExit("version must look like vX.Y.Z or X.Y.Z")
+
+          existing = set()
+          url = "https://pypi.org/pypi/{}/json".format(package_name)
+          try:
+              with urllib.request.urlopen(url, timeout=15) as response:
+                  payload = json.load(response)
+                  existing.update(payload.get("releases", {}).keys())
+          except urllib.error.HTTPError as exc:
+              if exc.code != 404:
+                  raise
+
+          version = base
+          if version in existing:
+              post = 1
+              while "{}.post{}".format(base, post) in existing:
+                  post += 1
+              version = "{}.post{}".format(base, post)
+
+          print("package_version={}".format(version))
+          PY
+
   build-linux-wheels:
+    needs: resolve-version
     strategy:
       fail-fast: false
       matrix:
@@ -53,6 +102,7 @@ jobs:
       - name: Build wheel only
         working-directory: python
         env:
+          D2S_PACKAGE_VERSION: ${{ needs.resolve-version.outputs.package_version }}
           D2S_WHEEL_TAG: ${{ matrix.wheel_tag }}
         run: |
           python -m pip install --upgrade pip build
@@ -66,11 +116,16 @@ jobs:
 
   publish-pypi:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build-linux-wheels
+    needs:
+      - resolve-version
+      - build-linux-wheels
     runs-on: ubuntu-24.04
     permissions:
       id-token: write
     steps:
+      - name: Show package version
+        run: echo "Publishing version ${{ needs.resolve-version.outputs.package_version }}"
+
       - uses: actions/download-artifact@v4
         with:
           path: dist

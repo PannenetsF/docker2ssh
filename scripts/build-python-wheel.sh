@@ -10,6 +10,7 @@ BIN_SRC="${BIN_SRC:-$ROOT_DIR/target/$TARGET/$PROFILE/d2s}"
 BIN_DST="$ROOT_DIR/python/src/docker2ssh/bin/d2s"
 WHEEL_PLATFORM_TAG="${WHEEL_PLATFORM_TAG:-}"
 WHEEL_TAG="${WHEEL_TAG:-}"
+PACKAGE_VERSION="${PACKAGE_VERSION:-}"
 
 cleanup() {
   rm -f "$BIN_DST"
@@ -36,6 +37,10 @@ if [[ -n "$WHEEL_TAG" ]]; then
   export D2S_WHEEL_TAG="$WHEEL_TAG"
 elif [[ -n "$WHEEL_PLATFORM_TAG" ]]; then
   export D2S_WHEEL_PLATFORM_TAG="$WHEEL_PLATFORM_TAG"
+fi
+
+if [[ -n "$PACKAGE_VERSION" ]]; then
+  export D2S_PACKAGE_VERSION="$PACKAGE_VERSION"
 fi
 
 "$VENV_DIR/bin/python" -m build --wheel
