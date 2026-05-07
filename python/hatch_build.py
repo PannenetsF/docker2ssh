@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sysconfig
 from pathlib import Path
+from typing import Any, Dict
 
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 
@@ -12,7 +13,7 @@ def _default_platform_tag() -> str:
 
 
 class CustomBuildHook(BuildHookInterface):
-    def initialize(self, version: str, build_data: dict[str, object]) -> None:
+    def initialize(self, version: str, build_data: Dict[str, Any]) -> None:
         bundled_binary = Path(self.root) / "src" / "docker2ssh" / "bin" / "d2s"
         if not bundled_binary.is_file():
             raise RuntimeError(

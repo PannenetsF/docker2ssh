@@ -5,24 +5,29 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional, Union
 
 
 class D2SError(RuntimeError):
     pass
 
 
-def _bundled_binary() -> Path | None:
+def _bundled_binary():
     candidate = Path(__file__).resolve().parent / "bin" / "d2s"
     if candidate.is_file():
         return candidate
     return None
 
 
-def _resolve_binary(binary: str | os.PathLike[str] | None = None) -> str:
+BinaryPath = Union[str, os.PathLike]
+
+
+def _resolve_binary(binary=None):
+    # Prefer an explicitly supplied path, then the bundled binary, then environment/PATH.
+    bundled = _bundled_binary()
     candidates = [
         str(binary) if binary else None,
-        str(_bundled_binary()) if _bundled_binary() else None,
+        str(bundled) if bundled else None,
         os.environ.get("D2S_BIN"),
         shutil.which("d2s"),
     ]
@@ -35,12 +40,12 @@ def _resolve_binary(binary: str | os.PathLike[str] | None = None) -> str:
 def run_d2s(
     args: Iterable[str],
     *,
-    binary: str | os.PathLike[str] | None = None,
-    config: str | os.PathLike[str] | None = None,
+    binary: Optional[BinaryPath] = None,
+    config: Optional[BinaryPath] = None,
     check: bool = True,
     capture_output: bool = True,
     text: bool = True,
-) -> subprocess.CompletedProcess[str]:
+) -> subprocess.CompletedProcess:
     cmd = [_resolve_binary(binary)]
     if config is not None:
         cmd.extend(["--config", str(config)])
@@ -54,12 +59,12 @@ def run_d2s(
     return proc
 
 
-@dataclass(slots=True)
+@dataclass
 class D2S:
-    binary: str | Path | None = None
-    config: str | Path | None = None
+    binary: Optional[Union[str, Path]] = None
+    config: Optional[Union[str, Path]] = None
 
-    def run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    def run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         return run_d2s(args, binary=self.binary, config=self.config, check=check)
 
     def help(self) -> str:
@@ -76,7 +81,7 @@ class D2S:
         *,
         host: str = "127.0.0.1",
         user: str = "docker",
-        identity: str | Path | None = None,
+        identity: Optional[Union[str, Path]] = None,
     ) -> str:
         args = ["doctor", "--host", host, "--user", user]
         if identity is not None:
@@ -88,7 +93,7 @@ class D2S:
         port: int,
         container: str,
         *,
-        shell: str | None = None,
+        shell: Optional[str] = None,
         clear_shell: bool = False,
     ) -> str:
         args = ["config", "set", str(port), container]
