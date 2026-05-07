@@ -1,1 +1,8 @@
 /target
+/.dbg
+/debug-*.md
+__pycache__/
+*.pyc
+/python/build
+/python/dist
+/python/*.egg-info

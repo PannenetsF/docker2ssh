@@ -36,6 +36,8 @@ Each SSH port maps to one Docker container reference.
 
 ## Build
 
+### Normal Build
+
 ```bash
 cargo build --release
 ```
@@ -45,6 +47,27 @@ Binary:
 ```bash
 ./target/release/d2s help
 ```
+
+### Static Linux Build
+
+For a Linux binary without external `.so` dependencies, build against `musl`:
+
+```bash
+./scripts/build-static-linux.sh
+```
+
+Default output:
+
+```bash
+./dist/d2s-x86_64-unknown-linux-musl
+```
+
+Notes:
+
+- Default target: `x86_64-unknown-linux-musl`
+- Override target with `TARGET=aarch64-unknown-linux-musl`
+- Use `USE_DOCKER=1` to build inside `clux/muslrust:stable`
+- The script verifies the output with `ldd` when available
 
 ## Commands
 
@@ -128,24 +151,81 @@ Example `systemd` unit:
 ```ini
 [Unit]
 Description=d2s docker2ssh
-After=network.target docker.service
+Documentation=https://code.byted.org/fanyunqian.1/docker2ssh
+After=network-online.target docker.service
+Wants=network-online.target
 Requires=docker.service
 
 [Service]
+Type=simple
 User=root
 Group=root
-ExecStart=/usr/local/bin/d2s serve
+EnvironmentFile=-/etc/d2s/d2s.env
+ExecStart=/usr/local/bin/d2s --config /etc/d2s/config.toml serve
 Restart=always
-RestartSec=2
+RestartSec=2s
 
 [Install]
 WantedBy=multi-user.target
+```
+
+Files included in this repository:
+
+- Unit file: `packaging/systemd/d2s.service`
+- Env example: `packaging/systemd/d2s.env.example`
+- Install script: `scripts/install-systemd.sh`
+
+Quick install:
+
+```bash
+cargo build --release
+sudo ./scripts/install-systemd.sh
+sudo systemctl restart d2s.service
+sudo systemctl status d2s.service --no-pager
 ```
 
 Why `root`:
 
 - Access to `/var/run/docker.sock` is required unless you run with a user in the Docker group.
 - Binding high ports like `2222` does not require root.
+
+## Python Package
+
+This repository also includes a Python package skeleton for publishing to PyPI.
+
+Package directory:
+
+- `python/`
+
+What it provides:
+
+- a `docker2ssh` console script
+- a small Python API that shells out to the `d2s` binary
+- `D2S` methods for `serve`, `show`, `doctor`, `config set/rm/list`
+
+Build the Python package:
+
+```bash
+cd python
+python3 -m pip install build
+python3 -m build
+```
+
+The package expects the `d2s` binary to be installed separately. You can point it to a non-standard path with:
+
+```bash
+export D2S_BIN=/usr/local/bin/d2s
+```
+
+Example:
+
+```python
+from docker2ssh import D2S
+
+client = D2S(config="/etc/d2s/config.toml")
+print(client.show())
+client.config_set(2222, "my-container")
+```
 
 ## Security Model
 
@@ -173,3 +253,10 @@ Current test coverage includes:
 - SSH end-to-end doctor flow over a mock Docker backend
 - SSH shell mode mapped to container exec
 - SSH exec mode mapped to container exec
+
+## Repo Layout
+
+- Rust server: `src/`
+- Static build script: `scripts/build-static-linux.sh`
+- systemd assets: `packaging/systemd/`
+- Python package: `python/`
