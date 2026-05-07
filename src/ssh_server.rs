@@ -799,7 +799,7 @@ async fn run_attached_process_with_pty(
     unsafe {
         cmd.pre_exec(move || {
             setsid().map_err(std::io::Error::other)?;
-            if libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
+            if libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
