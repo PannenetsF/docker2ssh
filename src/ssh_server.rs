@@ -15,8 +15,8 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 
 pub struct ServeManager {
@@ -145,6 +145,57 @@ fn bind_socket(addr: SocketAddr, v6_only: bool) -> anyhow::Result<TcpListener> {
     Ok(TcpListener::from_std(listener)?)
 }
 
+// #region debug-point A:reporting
+fn debug_config() -> (String, String) {
+    let mut url = "http://127.0.0.1:7777/event".to_string();
+    let mut session = "ssh-tty-failure".to_string();
+    if let Ok(raw) = std::fs::read_to_string(".dbg/ssh-tty-failure.env") {
+        for line in raw.lines() {
+            if let Some(value) = line.strip_prefix("DEBUG_SERVER_URL=") {
+                url = value.trim().to_string();
+            } else if let Some(value) = line.strip_prefix("DEBUG_SESSION_ID=") {
+                session = value.trim().to_string();
+            }
+        }
+    }
+    (url, session)
+}
+
+async fn debug_report(
+    run_id: &'static str,
+    hypothesis_id: &'static str,
+    location: &'static str,
+    msg: &'static str,
+    data: serde_json::Value,
+) {
+    let (url, session_id) = debug_config();
+    let Some(rest) = url.strip_prefix("http://") else {
+        return;
+    };
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, "event"));
+    let Ok(mut stream) = TcpStream::connect(authority).await else {
+        return;
+    };
+    let payload = serde_json::json!({
+        "sessionId": session_id,
+        "runId": run_id,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "msg": msg,
+        "data": data,
+    })
+    .to_string();
+    let request = format!(
+        "POST /{} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        path,
+        authority,
+        payload.len(),
+        payload
+    );
+    let _ = stream.write_all(request.as_bytes()).await;
+}
+// #endregion
+
 #[derive(Clone)]
 struct PortServer {
     mapping: MappingSpec,
@@ -244,11 +295,11 @@ impl server::Handler for PortHandler {
     async fn pty_request(
         &mut self,
         channel: ChannelId,
-        _term: &str,
-        _col_width: u32,
-        _row_height: u32,
-        _pix_width: u32,
-        _pix_height: u32,
+        term: &str,
+        col_width: u32,
+        row_height: u32,
+        pix_width: u32,
+        pix_height: u32,
         _modes: &[(russh::Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
@@ -256,6 +307,22 @@ impl server::Handler for PortHandler {
             bail!("missing channel state for pty request");
         };
         state.pty_requested = true;
+        // #region debug-point B:pty-request
+        tokio::spawn(debug_report(
+            "pre-fix",
+            "B",
+            "src/ssh_server.rs:pty_request",
+            "[DEBUG] SSH PTY requested",
+            serde_json::json!({
+                "channel": channel.to_string(),
+                "term": term,
+                "col_width": col_width,
+                "row_height": row_height,
+                "pix_width": pix_width,
+                "pix_height": pix_height,
+            }),
+        ));
+        // #endregion
         session.channel_success(channel)?;
         Ok(())
     }
@@ -280,6 +347,19 @@ impl server::Handler for PortHandler {
             bail!("missing channel state for shell request");
         };
         let mapping = self.mapping.clone();
+        // #region debug-point C:shell-request
+        tokio::spawn(debug_report(
+            "pre-fix",
+            "C",
+            "src/ssh_server.rs:shell_request",
+            "[DEBUG] SSH shell requested",
+            serde_json::json!({
+                "channel": channel.to_string(),
+                "container": mapping.container.clone(),
+                "pty_requested": state.pty_requested,
+            }),
+        ));
+        // #endregion
         session.channel_success(channel)?;
         tokio::spawn(async move {
             if let Err(err) = spawn_container_shell(state.channel, mapping, state.pty_requested).await {
@@ -331,6 +411,19 @@ async fn spawn_container_shell(
     let shell = resolve_container_shell(&mapping).await?;
     let mut cmd = docker_exec_base_command(&mapping.container, pty_requested);
     cmd.arg(shell);
+    // #region debug-point D:shell-command
+    tokio::spawn(debug_report(
+        "pre-fix",
+        "D",
+        "src/ssh_server.rs:spawn_container_shell",
+        "[DEBUG] Spawning container shell",
+        serde_json::json!({
+            "container": mapping.container,
+            "pty_requested": pty_requested,
+            "shell": cmd.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+        }),
+    ));
+    // #endregion
     run_attached_process(channel, cmd).await
 }
 
@@ -343,6 +436,19 @@ async fn spawn_container_exec(
     let shell = resolve_container_shell(&mapping).await?;
     let mut cmd = docker_exec_base_command(&mapping.container, pty_requested);
     cmd.arg(shell).arg("-c").arg(shell_command);
+    // #region debug-point E:exec-command
+    tokio::spawn(debug_report(
+        "pre-fix",
+        "E",
+        "src/ssh_server.rs:spawn_container_exec",
+        "[DEBUG] Spawning container exec",
+        serde_json::json!({
+            "container": mapping.container,
+            "pty_requested": pty_requested,
+            "argv": cmd.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+        }),
+    ));
+    // #endregion
     run_attached_process(channel, cmd).await
 }
 
@@ -397,6 +503,18 @@ fn docker_exec_base_command(container: &str, pty_requested: bool) -> Command {
 
 async fn run_attached_process(channel: Channel<Msg>, mut cmd: Command) -> anyhow::Result<()> {
     let mut child = cmd.spawn().context("failed to spawn docker exec")?;
+    let child_id = child.id();
+    // #region debug-point A:child-spawn
+    tokio::spawn(debug_report(
+        "pre-fix",
+        "A",
+        "src/ssh_server.rs:run_attached_process",
+        "[DEBUG] docker exec child spawned",
+        serde_json::json!({
+            "child_id": child_id,
+        }),
+    ));
+    // #endregion
     let mut child_stdin = child.stdin.take().context("missing child stdin")?;
     let mut child_stdout = child.stdout.take().context("missing child stdout")?;
     let mut child_stderr = child.stderr.take().context("missing child stderr")?;
@@ -412,6 +530,15 @@ async fn run_attached_process(channel: Channel<Msg>, mut cmd: Command) -> anyhow
                     child_stdin.write_all(&data).await?;
                 }
                 russh::ChannelMsg::Eof | russh::ChannelMsg::Close => {
+                    // #region debug-point A:stdin-close
+                    tokio::spawn(debug_report(
+                        "pre-fix",
+                        "A",
+                        "src/ssh_server.rs:stdin_task",
+                        "[DEBUG] SSH channel sent EOF/CLOSE",
+                        serde_json::json!({}),
+                    ));
+                    // #endregion
                     break;
                 }
                 russh::ChannelMsg::WindowAdjusted { .. } => {}
@@ -426,7 +553,30 @@ async fn run_attached_process(channel: Channel<Msg>, mut cmd: Command) -> anyhow
         Ok::<(), anyhow::Error>(())
     };
     let stderr_task = async {
-        let _ = tokio::io::copy(&mut child_stderr, &mut stderr_writer).await?;
+        let mut buf = [0_u8; 4096];
+        let mut captured = Vec::new();
+        loop {
+            let n = child_stderr.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            stderr_writer.write_all(&buf[..n]).await?;
+            if captured.len() < 1024 {
+                let remaining = 1024 - captured.len();
+                captured.extend_from_slice(&buf[..n.min(remaining)]);
+            }
+        }
+        // #region debug-point A:stderr-sample
+        tokio::spawn(debug_report(
+            "pre-fix",
+            "A",
+            "src/ssh_server.rs:stderr_task",
+            "[DEBUG] docker exec stderr completed",
+            serde_json::json!({
+                "sample": String::from_utf8_lossy(&captured).to_string(),
+            }),
+        ));
+        // #endregion
         Ok::<(), anyhow::Error>(())
     };
 
@@ -438,6 +588,18 @@ async fn run_attached_process(channel: Channel<Msg>, mut cmd: Command) -> anyhow
     stderr_res?;
     let status = status_res?;
     let code = status.code().unwrap_or(255).max(0) as u32;
+    // #region debug-point A:child-exit
+    tokio::spawn(debug_report(
+        "pre-fix",
+        "A",
+        "src/ssh_server.rs:run_attached_process:exit",
+        "[DEBUG] docker exec child exited",
+        serde_json::json!({
+            "code": code,
+            "success": status.success(),
+        }),
+    ));
+    // #endregion
 
     let _ = writer.shutdown().await;
     let _ = stderr_writer.shutdown().await;
