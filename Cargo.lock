@@ -578,6 +578,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "nix",
  "rand 0.10.1",
  "russh",
  "serde",

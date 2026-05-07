@@ -2,6 +2,9 @@ use crate::config::{ConfigStore, MappingSpec};
 use crate::docker::{ActiveMapping, DockerBackend, docker_authorized_command};
 use crate::proxy::{ProxyTarget, serve_channel_stream};
 use anyhow::{Context as _, bail};
+use nix::libc;
+use nix::pty::{Winsize, openpty};
+use nix::unistd::setsid;
 use russh::keys::{self, PrivateKey, PrivateKeyWithHashAlg, PublicKey};
 use russh::keys::ssh_key::LineEnding;
 use russh::server::{self, Auth, Msg, Server as _, Session};
@@ -10,6 +13,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::env;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -239,7 +243,16 @@ struct PortHandler {
 
 struct ChannelState {
     channel: Channel<Msg>,
-    pty_requested: bool,
+    pty: Option<PtySpec>,
+}
+
+#[derive(Clone)]
+struct PtySpec {
+    term: String,
+    cols: u32,
+    rows: u32,
+    px_width: u32,
+    px_height: u32,
 }
 
 impl server::Handler for PortHandler {
@@ -286,7 +299,7 @@ impl server::Handler for PortHandler {
             channel.id(),
             ChannelState {
                 channel,
-                pty_requested: false,
+                pty: None,
             },
         );
         Ok(true)
@@ -306,7 +319,13 @@ impl server::Handler for PortHandler {
         let Some(state) = self.channels.get_mut(&channel) else {
             bail!("missing channel state for pty request");
         };
-        state.pty_requested = true;
+        state.pty = Some(PtySpec {
+            term: term.to_string(),
+            cols: col_width,
+            rows: row_height,
+            px_width: pix_width,
+            px_height: pix_height,
+        });
         // #region debug-point B:pty-request
         tokio::spawn(debug_report(
             "pre-fix",
@@ -356,13 +375,13 @@ impl server::Handler for PortHandler {
             serde_json::json!({
                 "channel": channel.to_string(),
                 "container": mapping.container.clone(),
-                "pty_requested": state.pty_requested,
+                "pty_requested": state.pty.is_some(),
             }),
         ));
         // #endregion
         session.channel_success(channel)?;
         tokio::spawn(async move {
-            if let Err(err) = spawn_container_shell(state.channel, mapping, state.pty_requested).await {
+            if let Err(err) = spawn_container_shell(state.channel, mapping, state.pty).await {
                 eprintln!("shell task ended with error: {err:#}");
             }
         });
@@ -393,7 +412,7 @@ impl server::Handler for PortHandler {
             session.channel_success(channel)?;
             tokio::spawn(async move {
                 if let Err(err) =
-                    spawn_container_exec(state.channel, mapping, state.pty_requested, command).await
+                    spawn_container_exec(state.channel, mapping, state.pty, command).await
                 {
                     eprintln!("exec task ended with error: {err:#}");
                 }
@@ -406,10 +425,13 @@ impl server::Handler for PortHandler {
 async fn spawn_container_shell(
     channel: Channel<Msg>,
     mapping: MappingSpec,
-    pty_requested: bool,
+    pty: Option<PtySpec>,
 ) -> anyhow::Result<()> {
     let shell = resolve_container_shell(&mapping).await?;
-    let mut cmd = docker_exec_base_command(&mapping.container, pty_requested);
+    let mut cmd = docker_exec_base_command(&mapping.container, pty.is_some());
+    if let Some(pty) = pty.as_ref() {
+        cmd.env("TERM", &pty.term);
+    }
     cmd.arg(shell);
     // #region debug-point D:shell-command
     tokio::spawn(debug_report(
@@ -419,22 +441,25 @@ async fn spawn_container_shell(
         "[DEBUG] Spawning container shell",
         serde_json::json!({
             "container": mapping.container,
-            "pty_requested": pty_requested,
-            "shell": cmd.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+            "pty_requested": pty.is_some(),
+            "argv": cmd.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
         }),
     ));
     // #endregion
-    run_attached_process(channel, cmd).await
+    run_attached_process(channel, cmd, pty).await
 }
 
 async fn spawn_container_exec(
     channel: Channel<Msg>,
     mapping: MappingSpec,
-    pty_requested: bool,
+    pty: Option<PtySpec>,
     shell_command: String,
 ) -> anyhow::Result<()> {
     let shell = resolve_container_shell(&mapping).await?;
-    let mut cmd = docker_exec_base_command(&mapping.container, pty_requested);
+    let mut cmd = docker_exec_base_command(&mapping.container, pty.is_some());
+    if let Some(pty) = pty.as_ref() {
+        cmd.env("TERM", &pty.term);
+    }
     cmd.arg(shell).arg("-c").arg(shell_command);
     // #region debug-point E:exec-command
     tokio::spawn(debug_report(
@@ -444,12 +469,12 @@ async fn spawn_container_exec(
         "[DEBUG] Spawning container exec",
         serde_json::json!({
             "container": mapping.container,
-            "pty_requested": pty_requested,
+            "pty_requested": pty.is_some(),
             "argv": cmd.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
         }),
     ));
     // #endregion
-    run_attached_process(channel, cmd).await
+    run_attached_process(channel, cmd, pty).await
 }
 
 async fn resolve_container_shell(mapping: &MappingSpec) -> anyhow::Result<String> {
@@ -501,7 +526,21 @@ fn docker_exec_base_command(container: &str, pty_requested: bool) -> Command {
     cmd
 }
 
-async fn run_attached_process(channel: Channel<Msg>, mut cmd: Command) -> anyhow::Result<()> {
+async fn run_attached_process(
+    channel: Channel<Msg>,
+    cmd: Command,
+    pty: Option<PtySpec>,
+) -> anyhow::Result<()> {
+    if let Some(pty) = pty {
+        return run_attached_process_with_pty(channel, cmd, pty).await;
+    }
+    run_attached_process_with_pipes(channel, cmd).await
+}
+
+async fn run_attached_process_with_pipes(
+    channel: Channel<Msg>,
+    mut cmd: Command,
+) -> anyhow::Result<()> {
     let mut child = cmd.spawn().context("failed to spawn docker exec")?;
     let child_id = child.id();
     // #region debug-point A:child-spawn
@@ -607,6 +646,116 @@ async fn run_attached_process(channel: Channel<Msg>, mut cmd: Command) -> anyhow
     let _ = write_half.eof().await;
     let _ = write_half.close().await;
     Ok(())
+}
+
+async fn run_attached_process_with_pty(
+    channel: Channel<Msg>,
+    mut cmd: Command,
+    pty: PtySpec,
+) -> anyhow::Result<()> {
+    let winsize = Winsize {
+        ws_row: normalized_pty_dimension(pty.rows, 24),
+        ws_col: normalized_pty_dimension(pty.cols, 80),
+        ws_xpixel: normalized_pty_dimension(pty.px_width, 0),
+        ws_ypixel: normalized_pty_dimension(pty.px_height, 0),
+    };
+    let pty_pair = openpty(Some(&winsize), None).context("failed to allocate PTY")?;
+    let master_file = std::fs::File::from(pty_pair.master);
+    let slave_file = std::fs::File::from(pty_pair.slave);
+    let slave_fd = slave_file.as_raw_fd();
+    let stdin_file = slave_file.try_clone()?;
+    let stdout_file = slave_file.try_clone()?;
+
+    cmd.stdin(Stdio::from(stdin_file))
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(slave_file));
+
+    unsafe {
+        cmd.pre_exec(move || {
+            setsid().map_err(std::io::Error::other)?;
+            if libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    // #region debug-point A:pty-spawn
+    tokio::spawn(debug_report(
+        "pre-fix",
+        "A",
+        "src/ssh_server.rs:run_attached_process_with_pty",
+        "[DEBUG] Running docker exec with allocated PTY",
+        serde_json::json!({
+            "term": pty.term,
+            "cols": winsize.ws_col,
+            "rows": winsize.ws_row,
+        }),
+    ));
+    // #endregion
+
+    let mut child = cmd.spawn().context("failed to spawn docker exec with PTY")?;
+    let child_id = child.id();
+    let master_reader = tokio::fs::File::from_std(master_file.try_clone()?);
+    let mut master_writer = tokio::fs::File::from_std(master_file);
+
+    let (mut read_half, write_half) = channel.split();
+    let mut writer = write_half.make_writer();
+
+    let stdin_task = async {
+        while let Some(msg) = read_half.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { data } => {
+                    master_writer.write_all(&data).await?;
+                }
+                russh::ChannelMsg::Eof | russh::ChannelMsg::Close => {
+                    break;
+                }
+                russh::ChannelMsg::WindowAdjusted { .. } => {}
+                _ => {}
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    let stdout_task = async {
+        let mut master_reader = master_reader;
+        let _ = tokio::io::copy(&mut master_reader, &mut writer).await?;
+        Ok::<(), anyhow::Error>(())
+    };
+    let (stdin_res, stdout_res, status_res) = tokio::join!(stdin_task, stdout_task, child.wait());
+
+    stdin_res?;
+    stdout_res?;
+    let status = status_res?;
+    let code = status.code().unwrap_or(255).max(0) as u32;
+
+    // #region debug-point A:pty-exit
+    tokio::spawn(debug_report(
+        "pre-fix",
+        "A",
+        "src/ssh_server.rs:run_attached_process_with_pty:exit",
+        "[DEBUG] docker exec PTY child exited",
+        serde_json::json!({
+            "child_id": child_id,
+            "code": code,
+            "success": status.success(),
+        }),
+    ));
+    // #endregion
+
+    let _ = writer.shutdown().await;
+    let _ = write_half.exit_status(code).await;
+    let _ = write_half.eof().await;
+    let _ = write_half.close().await;
+    Ok(())
+}
+
+fn normalized_pty_dimension(value: u32, default_value: u16) -> u16 {
+    if value == 0 {
+        default_value
+    } else {
+        value.min(u16::MAX as u32) as u16
+    }
 }
 
 struct Authz {
