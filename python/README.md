@@ -1,10 +1,10 @@
 # docker2ssh Python Package
 
-`docker2ssh` is a thin Python wrapper around the `d2s` binary.
+`docker2ssh` is a thin Python wrapper around a bundled precompiled `d2s` binary.
 
 It does not reimplement the SSH server in Python. Instead, it:
 
-- discovers the `d2s` executable
+- discovers the bundled `d2s` executable
 - exposes a small Python API
 - provides a `docker2ssh` console script
 
@@ -14,7 +14,8 @@ It does not reimplement the SSH server in Python. Instead, it:
 pip install docker2ssh
 ```
 
-Set `D2S_BIN` if `d2s` is not on `PATH`:
+Published Linux wheels bundle `d2s` directly. Set `D2S_BIN` only if you want to override
+the bundled executable:
 
 ```bash
 export D2S_BIN=/usr/local/bin/d2s

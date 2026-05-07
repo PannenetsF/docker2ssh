@@ -12,9 +12,17 @@ class D2SError(RuntimeError):
     pass
 
 
+def _bundled_binary() -> Path | None:
+    candidate = Path(__file__).resolve().parent / "bin" / "d2s"
+    if candidate.is_file():
+        return candidate
+    return None
+
+
 def _resolve_binary(binary: str | os.PathLike[str] | None = None) -> str:
     candidates = [
         str(binary) if binary else None,
+        str(_bundled_binary()) if _bundled_binary() else None,
         os.environ.get("D2S_BIN"),
         shutil.which("d2s"),
     ]

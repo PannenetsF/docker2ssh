@@ -191,7 +191,8 @@ Why `root`:
 
 ## Python Package
 
-This repository also includes a Python package skeleton for publishing to PyPI.
+This repository also includes a wheel-only Python package for publishing precompiled
+Linux builds to PyPI.
 
 Package directory:
 
@@ -202,16 +203,23 @@ What it provides:
 - a `docker2ssh` console script
 - a small Python API that shells out to the `d2s` binary
 - `D2S` methods for `serve`, `show`, `doctor`, `config set/rm/list`
+- a bundled `d2s` binary inside each published wheel
 
-Build the Python package:
+Build a precompiled wheel after producing the static binary:
 
 ```bash
-cd python
-python3 -m pip install build
-python3 -m build
+TARGET=x86_64-unknown-linux-musl ./scripts/build-static-linux.sh
+TARGET=x86_64-unknown-linux-musl ./scripts/build-python-wheel.sh
 ```
 
-The package expects the `d2s` binary to be installed separately. You can point it to a non-standard path with:
+Notes:
+
+- The wheel metadata is emitted as `py3-none-<platform>`
+- CI builds Linux `x86_64` and `aarch64` wheels in `.github/workflows/python-wheels.yml`
+- No source distribution is required for installs from published wheels
+- `D2S_BIN` still overrides the bundled binary when you want to use another `d2s`
+
+If you want to point the wrapper at a non-standard binary path:
 
 ```bash
 export D2S_BIN=/usr/local/bin/d2s
