@@ -562,7 +562,7 @@ async fn run_attached_process_with_pipes(
     let mut writer = write_half.make_writer();
     let mut stderr_writer = write_half.make_writer_ext(Some(1));
 
-    let stdin_task = async {
+    let stdin_task = tokio::spawn(async move {
         while let Some(msg) = read_half.wait().await {
             match msg {
                 russh::ChannelMsg::Data { data } => {
@@ -586,12 +586,12 @@ async fn run_attached_process_with_pipes(
         }
         child_stdin.shutdown().await?;
         Ok::<(), anyhow::Error>(())
-    };
-    let stdout_task = async {
+    });
+    let stdout_task = tokio::spawn(async move {
         let _ = tokio::io::copy(&mut child_stdout, &mut writer).await?;
         Ok::<(), anyhow::Error>(())
-    };
-    let stderr_task = async {
+    });
+    let stderr_task = tokio::spawn(async move {
         let mut buf = [0_u8; 4096];
         let mut captured = Vec::new();
         loop {
@@ -617,15 +617,17 @@ async fn run_attached_process_with_pipes(
         ));
         // #endregion
         Ok::<(), anyhow::Error>(())
-    };
+    });
 
-    let (stdin_res, stdout_res, stderr_res, status_res) =
-        tokio::join!(stdin_task, stdout_task, stderr_task, child.wait());
-
-    stdin_res?;
-    stdout_res?;
-    stderr_res?;
-    let status = status_res?;
+    let status = child.wait().await?;
+    stdin_task.abort();
+    let _ = stdin_task.await;
+    stdout_task
+        .await
+        .context("stdout task join failed")??;
+    stderr_task
+        .await
+        .context("stderr task join failed")??;
     let code = status.code().unwrap_or(255).max(0) as u32;
     // #region debug-point A:child-exit
     tokio::spawn(debug_report(
@@ -640,8 +642,6 @@ async fn run_attached_process_with_pipes(
     ));
     // #endregion
 
-    let _ = writer.shutdown().await;
-    let _ = stderr_writer.shutdown().await;
     let _ = write_half.exit_status(code).await;
     let _ = write_half.eof().await;
     let _ = write_half.close().await;
@@ -702,7 +702,7 @@ async fn run_attached_process_with_pty(
     let (mut read_half, write_half) = channel.split();
     let mut writer = write_half.make_writer();
 
-    let stdin_task = async {
+    let stdin_task = tokio::spawn(async move {
         while let Some(msg) = read_half.wait().await {
             match msg {
                 russh::ChannelMsg::Data { data } => {
@@ -716,17 +716,18 @@ async fn run_attached_process_with_pty(
             }
         }
         Ok::<(), anyhow::Error>(())
-    };
-    let stdout_task = async {
+    });
+    let stdout_task = tokio::spawn(async move {
         let mut master_reader = master_reader;
         let _ = tokio::io::copy(&mut master_reader, &mut writer).await?;
         Ok::<(), anyhow::Error>(())
-    };
-    let (stdin_res, stdout_res, status_res) = tokio::join!(stdin_task, stdout_task, child.wait());
-
-    stdin_res?;
-    stdout_res?;
-    let status = status_res?;
+    });
+    let status = child.wait().await?;
+    stdin_task.abort();
+    let _ = stdin_task.await;
+    stdout_task
+        .await
+        .context("pty stdout task join failed")??;
     let code = status.code().unwrap_or(255).max(0) as u32;
 
     // #region debug-point A:pty-exit
@@ -743,7 +744,6 @@ async fn run_attached_process_with_pty(
     ));
     // #endregion
 
-    let _ = writer.shutdown().await;
     let _ = write_half.exit_status(code).await;
     let _ = write_half.eof().await;
     let _ = write_half.close().await;
@@ -1147,6 +1147,30 @@ exit 4
         let mut out = Vec::new();
         reader.read_to_end(&mut out).await.unwrap();
         assert!(String::from_utf8_lossy(&out).contains("hello from shell"));
+        unsafe {
+            std::env::remove_var("D2S_DOCKER_BIN");
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_request_closes_when_shell_exits_without_client_eof() {
+        let _guard = env_lock().lock().unwrap();
+        let (addr, _tmp) = spawn_test_server(None).await;
+        let session = connect_test_client(addr).await;
+        let mut channel = session.channel_open_session().await.unwrap();
+        channel
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .unwrap();
+        channel.request_shell(true).await.unwrap();
+
+        let mut writer = channel.make_writer();
+        writer.write_all(b"exit\n").await.unwrap();
+
+        let mut reader = channel.make_reader();
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.unwrap();
+        assert!(out.is_empty() || !String::from_utf8_lossy(&out).contains("the input device is not a TTY"));
         unsafe {
             std::env::remove_var("D2S_DOCKER_BIN");
         }
