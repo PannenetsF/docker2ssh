@@ -11,7 +11,8 @@ It does not reimplement the SSH server in Python. Instead, it:
 ## Install
 
 ```bash
-pip install docker2ssh
+python3 -m pip install -U pip
+python3 -m pip install -U docker2ssh
 ```
 
 Published Linux wheels bundle `d2s` directly. Set `D2S_BIN` only if you want to override
@@ -20,6 +21,12 @@ the bundled executable:
 ```bash
 export D2S_BIN=/usr/local/bin/d2s
 ```
+
+Notes:
+
+- `pip install -U docker2ssh` also works as the update command
+- Upgrading `pip` first is recommended on older Linux systems
+- Published wheels currently target Linux `x86_64` and `aarch64`
 
 ## Python API
 

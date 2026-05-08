@@ -205,6 +205,19 @@ What it provides:
 - `D2S` methods for `serve`, `show`, `doctor`, `config set/rm/list`
 - a bundled `d2s` binary inside each published wheel
 
+Install or update from PyPI:
+
+```bash
+python3 -m pip install -U pip
+python3 -m pip install -U docker2ssh
+```
+
+Notes:
+
+- The published package is for Linux `x86_64` and `aarch64`
+- Upgrading `pip` first is recommended on older systems so it recognizes the published wheel tags
+- Installing or upgrading the package also installs or updates the bundled `d2s` binary used by the `docker2ssh` wrapper
+
 Build a precompiled wheel after producing the static binary:
 
 ```bash
