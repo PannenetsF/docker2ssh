@@ -1,6 +1,8 @@
-# d2s
+# docker2ssh
 
-`d2s` (`docker2ssh`) is a Rust service for Linux servers.
+`docker2ssh` is the primary CLI and installation path for this project on Linux servers.
+
+It ships a bundled `d2s` binary, but the default user-facing command is `docker2ssh`.
 
 It exposes SSH-compatible ports. Each port is bound to one Docker container and supports two access modes:
 
@@ -22,21 +24,24 @@ DOCKER_HOST=ssh://docker@your-server:2222 docker ps
 
 Each SSH port maps to one Docker container reference.
 
-## What It Does
+## Install
 
-- Exposes one SSH listener per configured port.
-- Accepts normal SSH shell / exec requests and maps them to `docker exec`.
-- Accepts Docker CLI's `docker system dial-stdio` exec request.
-- Proxies Docker HTTP API traffic to the host Docker socket.
-- Restricts `/containers/<id or name>/...` requests to the mapped container.
-- Allows container references by name, full ID, or short ID.
-- Supports stopped containers in config storage.
-- Shows only running containers in `show`.
-- Verifies active mappings with `doctor`.
+### Install from PyPI
 
-## Build
+```bash
+python3 -m pip install -U pip
+python3 -m pip install -U docker2ssh
+```
 
-### Normal Build
+Notes:
+
+- The published package is for Linux `x86_64` and `aarch64`
+- Upgrading `pip` first is recommended on older systems so it recognizes the published wheel tags
+- Installing or upgrading the package also installs or updates the bundled `d2s` runtime used by `docker2ssh`
+
+### Build from Source
+
+#### Normal Build
 
 ```bash
 cargo build --release
@@ -48,7 +53,7 @@ Binary:
 ./target/release/d2s help
 ```
 
-### Static Linux Build
+#### Static Linux Build
 
 For a Linux binary without external `.so` dependencies, build against `musl`:
 
@@ -69,24 +74,39 @@ Notes:
 - Use `USE_DOCKER=1` to build inside `clux/muslrust:stable`
 - The script verifies the output with `ldd` when available
 
+## What It Does
+
+- Exposes one SSH listener per configured port.
+- Accepts normal SSH shell / exec requests and maps them to `docker exec`.
+- Accepts Docker CLI's `docker system dial-stdio` exec request.
+- Proxies Docker HTTP API traffic to the host Docker socket.
+- Restricts `/containers/<id or name>/...` requests to the mapped container.
+- Allows container references by name, full ID, or short ID.
+- Supports stopped containers in config storage.
+- Shows only running containers in `show`.
+- Verifies active mappings with `doctor`.
+
 ## Commands
 
 ```bash
-d2s
-d2s help
-d2s config set <port> <container>
-d2s config rm <port>
-d2s config list
-d2s show
-d2s doctor --host 127.0.0.1 --user docker [--identity /path/to/id_ed25519]
-d2s serve
+docker2ssh
+docker2ssh help
+docker2ssh config set <port> <container>
+docker2ssh config rm <port>
+docker2ssh config list
+docker2ssh show
+docker2ssh doctor --host 127.0.0.1 --user docker [--identity /path/to/id_ed25519]
+docker2ssh serve
+docker2ssh stop
 ```
 
 Notes:
 
-- `d2s` without subcommand is the same as `d2s serve`.
+- `docker2ssh` without subcommand prints help.
 - `config set` validates that the container exists, even if stopped.
 - `show` only prints mappings whose container is currently running.
+- `serve` starts a background daemon and writes a pid file next to the config file.
+- `stop` stops the daemon started from the same config path.
 
 ## Config File
 
@@ -117,22 +137,23 @@ Fields:
 - `listen_host`: bind address for SSH listeners.
 - `docker_socket`: Docker daemon Unix socket path.
 - `authorized_keys`: optional OpenSSH `authorized_keys` file. If omitted, server accepts unauthenticated test connections. Do not use that in production.
-- `host_key`: optional SSH host private key path. If missing, `d2s` auto-generates one.
-- `mappings[].shell`: optional shell override inside the container. If omitted, `d2s` tries `/bin/bash`, then `/bin/sh`, then `sh`.
+- `host_key`: optional SSH host private key path. If missing, the bundled runtime auto-generates one.
+- `mappings[].shell`: optional shell override inside the container. If omitted, the bundled runtime tries `/bin/bash`, then `/bin/sh`, then `sh`.
 
 ## Typical Usage
 
 Map a port to a container:
 
 ```bash
-d2s config set 2222 my-app
-d2s config set 2223 my-app --shell /bin/bash
+docker2ssh config set 2222 my-app
+docker2ssh config set 2223 my-app --shell /bin/bash
 ```
 
-Start the service:
+Start the daemon:
 
 ```bash
-d2s serve
+docker2ssh serve
+docker2ssh show
 ```
 
 From another machine:
@@ -144,55 +165,32 @@ DOCKER_HOST=ssh://docker@your-server:2222 docker ps
 DOCKER_HOST=ssh://docker@your-server:2222 docker cp ./file.txt my-app:/tmp/file.txt
 ```
 
-## Linux Deployment
-
-Example `systemd` unit:
-
-```ini
-[Unit]
-Description=d2s docker2ssh
-Documentation=https://code.byted.org/fanyunqian.1/docker2ssh
-After=network-online.target docker.service
-Wants=network-online.target
-Requires=docker.service
-
-[Service]
-Type=simple
-User=root
-Group=root
-EnvironmentFile=-/etc/d2s/d2s.env
-ExecStart=/usr/local/bin/d2s --config /etc/d2s/config.toml serve
-Restart=always
-RestartSec=2s
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Files included in this repository:
-
-- Unit file: `packaging/systemd/d2s.service`
-- Env example: `packaging/systemd/d2s.env.example`
-- Install script: `scripts/install-systemd.sh`
-
-Quick install:
+Stop it later:
 
 ```bash
-cargo build --release
-sudo ./scripts/install-systemd.sh
-sudo systemctl restart d2s.service
-sudo systemctl status d2s.service --no-pager
+docker2ssh stop
 ```
 
-Why `root`:
+## Daemon Usage
+
+`docker2ssh serve` already detaches into the background, so you can run it directly without an external service manager for the normal case.
+
+Typical lifecycle:
+
+```bash
+docker2ssh --config /etc/d2s/config.toml serve
+docker2ssh --config /etc/d2s/config.toml stop
+```
+
+Notes:
 
 - Access to `/var/run/docker.sock` is required unless you run with a user in the Docker group.
 - Binding high ports like `2222` does not require root.
+- The daemon pid file is written next to the config file as `d2s.pid`.
 
 ## Python Package
 
-This repository also includes a wheel-only Python package for publishing precompiled
-Linux builds to PyPI.
+This repository also includes the Python packaging used to publish precompiled Linux builds to PyPI.
 
 Package directory:
 
@@ -204,19 +202,6 @@ What it provides:
 - a small Python API that shells out to the `d2s` binary
 - `D2S` methods for `serve`, `show`, `doctor`, `config set/rm/list`
 - a bundled `d2s` binary inside each published wheel
-
-Install or update from PyPI:
-
-```bash
-python3 -m pip install -U pip
-python3 -m pip install -U docker2ssh
-```
-
-Notes:
-
-- The published package is for Linux `x86_64` and `aarch64`
-- Upgrading `pip` first is recommended on older systems so it recognizes the published wheel tags
-- Installing or upgrading the package also installs or updates the bundled `d2s` binary used by the `docker2ssh` wrapper
 
 Build a precompiled wheel after producing the static binary:
 
@@ -231,7 +216,7 @@ Notes:
 - CI builds Linux `x86_64` and `aarch64` wheels in `.github/workflows/python-wheels.yml`
 - Tag `vX.Y.Z` publishes package version `X.Y.Z`; if that version already exists on PyPI, CI automatically uses `X.Y.Z.postN`
 - No source distribution is required for installs from published wheels
-- `D2S_BIN` still overrides the bundled binary when you want to use another `d2s`
+- `D2S_BIN` still overrides the bundled binary when you want to use another runtime binary
 
 If you want to point the wrapper at a non-standard binary path:
 
@@ -280,5 +265,4 @@ Current test coverage includes:
 
 - Rust server: `src/`
 - Static build script: `scripts/build-static-linux.sh`
-- systemd assets: `packaging/systemd/`
 - Python package: `python/`
