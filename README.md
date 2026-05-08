@@ -1,28 +1,16 @@
 # docker2ssh
 
-`docker2ssh` is the primary CLI and installation path for this project on Linux servers.
+[中文说明](./README.zh-CN.md)
 
-It ships a bundled `d2s` binary, but the default user-facing command is `docker2ssh`.
+`docker2ssh` is a Linux tool for exposing Docker containers through SSH-compatible ports.
 
-It exposes SSH-compatible ports. Each port is bound to one Docker container and supports two access modes:
+It is useful for Cursor, Code-OSS, Trae, and other VS Code-like environments that cannot use the Remote Docker extension because of compliance or platform restrictions.
 
-- normal SSH access, mapped to `docker exec`
-- Docker CLI remote access, mapped to `docker system dial-stdio`
+Typical use cases:
 
-This makes clients such as:
-
-- `docker ps`
-- `docker inspect`
-- `docker cp`
-- `docker exec`
-
-work through:
-
-```bash
-DOCKER_HOST=ssh://docker@your-server:2222 docker ps
-```
-
-Each SSH port maps to one Docker container reference.
+- connect to a specific container with normal SSH tooling
+- use `DOCKER_HOST=ssh://...` from local Docker CLI workflows
+- support editor workflows that need SSH access or Docker-over-SSH access to a remote container environment
 
 ## Install
 
