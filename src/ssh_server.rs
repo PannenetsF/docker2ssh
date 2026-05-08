@@ -3,8 +3,12 @@ use crate::docker::{ActiveMapping, DockerBackend, docker_authorized_command};
 use crate::proxy::{ProxyTarget, serve_channel_stream};
 use anyhow::{Context as _, bail};
 use nix::libc;
+#[cfg(target_family = "unix")]
+use nix::sys::signal::{Signal, kill};
 use nix::pty::{Winsize, openpty};
 use nix::unistd::setsid;
+#[cfg(target_family = "unix")]
+use nix::unistd::Pid;
 use russh::keys::{self, PrivateKey, PrivateKeyWithHashAlg, PublicKey};
 use russh::keys::ssh_key::LineEnding;
 use russh::server::{self, Auth, Msg, Server as _, Session};
@@ -14,6 +18,8 @@ use std::env;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsRawFd;
+#[cfg(target_family = "unix")]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -38,17 +44,82 @@ impl ServeManager {
         Self { store, docker }
     }
 
-    pub async fn run(self) -> anyhow::Result<()> {
+    pub async fn run_daemon(self) -> anyhow::Result<()> {
+        let cfg = self.store.load().await?;
+        if cfg.mappings.is_empty() {
+            println!("no mappings configured in {}", self.store.path().display());
+            return Ok(());
+        }
+
+        for mapping in &cfg.mappings {
+            println!("{} -> {}", mapping.port, mapping.container);
+        }
+
+        let pid_path = self.store.pid_path();
+        ensure_daemon_not_running(&pid_path).await?;
+
+        let exe = std::env::current_exe().context("failed to resolve current executable")?;
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("--config")
+            .arg(self.store.path())
+            .arg("serve")
+            .arg("--foreground")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        #[cfg(target_family = "unix")]
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+
+        let child = cmd.spawn().context("failed to spawn background d2s daemon")?;
+        let pid = child.id();
+        fs::write(&pid_path, format!("{pid}\n"))
+            .await
+            .with_context(|| format!("failed to write pid file {}", pid_path.display()))?;
+        println!("daemon started with pid {pid}");
+        Ok(())
+    }
+
+    pub async fn run_foreground(self) -> anyhow::Result<()> {
         let cfg = self.store.load().await?;
         let host_key_path = resolve_host_key_path(self.store.path(), cfg.host_key.as_deref())?;
         let host_key = load_or_generate_host_key(&host_key_path).await?;
         let authz = Arc::new(Authz::load(cfg.authorized_keys.as_deref()).await?);
+        let pid_path = self.store.pid_path();
 
         if cfg.mappings.is_empty() {
             println!("no mappings configured in {}", self.store.path().display());
-            tokio::signal::ctrl_c().await?;
             return Ok(());
         }
+
+        if pid_path.exists() {
+            let current_pid = i32::try_from(std::process::id()).context("current pid does not fit in i32")?;
+            match fs::read_to_string(&pid_path).await {
+                Ok(raw) => {
+                    let existing_pid = raw.trim().parse::<i32>().unwrap_or_default();
+                    if existing_pid != current_pid && process_is_running(existing_pid) {
+                        bail!(
+                            "d2s daemon already running with pid {existing_pid} (pid file: {})",
+                            pid_path.display()
+                        );
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("failed to read {}", pid_path.display()));
+                }
+            }
+        }
+
+        fs::write(&pid_path, format!("{}\n", std::process::id()))
+            .await
+            .with_context(|| format!("failed to write pid file {}", pid_path.display()))?;
 
         let mut handles = Vec::new();
         for mapping in cfg.mappings {
@@ -76,10 +147,92 @@ impl ServeManager {
             }
         }
 
-        tokio::signal::ctrl_c().await?;
+        wait_for_shutdown_signal().await?;
         for handle in handles {
             handle.abort();
         }
+        let _ = fs::remove_file(&pid_path).await;
+        Ok(())
+    }
+
+    pub async fn stop_daemon(store: &ConfigStore) -> anyhow::Result<()> {
+        let pid_path = store.pid_path();
+        let raw = fs::read_to_string(&pid_path)
+            .await
+            .with_context(|| format!("failed to read pid file {}", pid_path.display()))?;
+        let pid: i32 = raw
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid pid in {}", pid_path.display()))?;
+
+        #[cfg(target_family = "unix")]
+        {
+            if let Err(err) = kill(Pid::from_raw(pid), Signal::SIGTERM) {
+                if matches!(err, nix::errno::Errno::ESRCH) {
+                    let _ = fs::remove_file(&pid_path).await;
+                    bail!("d2s daemon not running");
+                }
+                return Err(err).context("failed to signal d2s daemon");
+            }
+        }
+
+        #[cfg(not(target_family = "unix"))]
+        {
+            let _ = pid;
+            bail!("stop is only supported on unix platforms");
+        }
+
+        println!("sent SIGTERM to daemon pid {pid}");
+        Ok(())
+    }
+}
+
+async fn ensure_daemon_not_running(pid_path: &Path) -> anyhow::Result<()> {
+    match fs::read_to_string(pid_path).await {
+        Ok(raw) => {
+            let pid: i32 = raw
+                .trim()
+                .parse()
+                .with_context(|| format!("invalid pid in {}", pid_path.display()))?;
+            if process_is_running(pid) {
+                bail!(
+                    "d2s daemon already running with pid {pid} (pid file: {})",
+                    pid_path.display()
+                );
+            }
+            let _ = fs::remove_file(pid_path).await;
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to read {}", pid_path.display())),
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn process_is_running(pid: i32) -> bool {
+    kill(Pid::from_raw(pid), None).is_ok()
+}
+
+#[cfg(not(target_family = "unix"))]
+fn process_is_running(_pid: i32) -> bool {
+    false
+}
+
+async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
+    #[cfg(target_family = "unix")]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .context("failed to register SIGTERM handler")?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.context("failed waiting for Ctrl-C")?,
+            _ = sigterm.recv() => {}
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(target_family = "unix"))]
+    {
+        tokio::signal::ctrl_c().await?;
         Ok(())
     }
 }

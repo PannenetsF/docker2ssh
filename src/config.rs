@@ -78,6 +78,13 @@ impl ConfigStore {
         &self.path
     }
 
+    pub fn pid_path(&self) -> PathBuf {
+        self.path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("d2s.pid")
+    }
+
     pub async fn load(&self) -> anyhow::Result<ConfigFile> {
         let raw = fs::read_to_string(&self.path).await?;
         let cfg: ConfigFile =
@@ -162,5 +169,13 @@ mod tests {
         let cfg = store.load().await.unwrap();
         assert_eq!(cfg.mappings.len(), 1);
         assert_eq!(cfg.mappings[0].port, 2223);
+    }
+
+    #[test]
+    fn pid_path_lives_next_to_config() {
+        let store = ConfigStore {
+            path: PathBuf::from("/tmp/d2s/config.toml"),
+        };
+        assert_eq!(store.pid_path(), PathBuf::from("/tmp/d2s/d2s.pid"));
     }
 }

@@ -22,7 +22,13 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
     /// Run the SSH server(s) based on active config.
-    Serve,
+    Serve {
+        #[arg(long, hide = true)]
+        foreground: bool,
+    },
+
+    /// Stop a background d2s daemon started from the same config path.
+    Stop,
 
     /// Manage port<->container mappings.
     Config {
@@ -73,12 +79,18 @@ impl Cli {
     pub async fn run(self) -> anyhow::Result<()> {
         let store = ConfigStore::load_or_create(self.config.clone()).await?;
 
-        match self.cmd.unwrap_or(Cmd::Serve) {
-            Cmd::Serve => {
+        match self.cmd.unwrap_or(Cmd::Serve { foreground: false }) {
+            Cmd::Serve { foreground } => {
                 let cfg = store.load().await?;
                 let docker = DockerBackend::from_env_or_config(&cfg)?;
-                ServeManager::new(store, docker).run().await?;
+                let manager = ServeManager::new(store, docker);
+                if foreground {
+                    manager.run_foreground().await?;
+                } else {
+                    manager.run_daemon().await?;
+                }
             }
+            Cmd::Stop => ServeManager::stop_daemon(&store).await?,
             Cmd::Config { cmd } => match cmd {
                 ConfigCmd::Set {
                     port,
