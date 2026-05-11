@@ -1,4 +1,4 @@
-use crate::config::{ConfigStore, MappingSpec};
+use crate::config::{ConfigFile, ConfigStore, MappingSpec};
 use crate::docker::{ActiveMapping, DockerBackend, docker_authorized_command};
 use crate::proxy::{ProxyTarget, serve_channel_stream};
 use anyhow::{Context as _, bail};
@@ -14,8 +14,9 @@ use russh::keys::ssh_key::LineEnding;
 use russh::server::{self, Auth, Msg, Server as _, Session};
 use russh::{Channel, ChannelId};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::env;
 use std::collections::{HashMap, HashSet};
+use std::env;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsRawFd;
 #[cfg(target_family = "unix")]
@@ -36,19 +37,21 @@ use std::net::ToSocketAddrs;
 
 pub struct ServeManager {
     store: ConfigStore,
-    docker: DockerBackend,
+    _docker: DockerBackend,
 }
 
 impl ServeManager {
     pub fn new(store: ConfigStore, docker: DockerBackend) -> Self {
-        Self { store, docker }
+        Self {
+            store,
+            _docker: docker,
+        }
     }
 
     pub async fn run_daemon(self) -> anyhow::Result<()> {
         let cfg = self.store.load().await?;
         if cfg.mappings.is_empty() {
             println!("no mappings configured in {}", self.store.path().display());
-            return Ok(());
         }
 
         for mapping in &cfg.mappings {
@@ -86,16 +89,19 @@ impl ServeManager {
     }
 
     pub async fn run_foreground(self) -> anyhow::Result<()> {
-        let cfg = self.store.load().await?;
-        let host_key_path = resolve_host_key_path(self.store.path(), cfg.host_key.as_deref())?;
-        let host_key = load_or_generate_host_key(&host_key_path).await?;
-        let authz = Arc::new(Authz::load(cfg.authorized_keys.as_deref()).await?);
-        let pid_path = self.store.pid_path();
+        self.run_foreground_until_shutdown(wait_for_shutdown_signal(), Duration::from_secs(1))
+            .await
+    }
 
-        if cfg.mappings.is_empty() {
-            println!("no mappings configured in {}", self.store.path().display());
-            return Ok(());
-        }
+    async fn run_foreground_until_shutdown<F>(
+        self,
+        shutdown: F,
+        reload_interval: Duration,
+    ) -> anyhow::Result<()>
+    where
+        F: Future<Output = anyhow::Result<()>> + Send,
+    {
+        let pid_path = self.store.pid_path();
 
         if pid_path.exists() {
             let current_pid = i32::try_from(std::process::id()).context("current pid does not fit in i32")?;
@@ -121,38 +127,124 @@ impl ServeManager {
             .await
             .with_context(|| format!("failed to write pid file {}", pid_path.display()))?;
 
-        let mut handles = Vec::new();
-        for mapping in cfg.mappings {
+        let mut current_raw = fs::read(self.store.path())
+            .await
+            .with_context(|| format!("failed to read {}", self.store.path().display()))?;
+        let mut current_cfg = parse_config_bytes(&current_raw, self.store.path())?;
+        let mut active = self.start_listener_set(&current_cfg).await?;
+        let mut interval = tokio::time::interval(reload_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tokio::pin!(shutdown);
+
+        let result = loop {
+            tokio::select! {
+                result = &mut shutdown => break result,
+                _ = interval.tick() => {
+                    self.reload_if_config_changed(&mut current_raw, &mut current_cfg, &mut active).await;
+                }
+            }
+        };
+
+        active.stop().await;
+        let _ = fs::remove_file(&pid_path).await;
+        result
+    }
+
+    async fn reload_if_config_changed(
+        &self,
+        current_raw: &mut Vec<u8>,
+        current_cfg: &mut ConfigFile,
+        active: &mut ActiveListeners,
+    ) {
+        let raw = match fs::read(self.store.path()).await {
+            Ok(raw) => raw,
+            Err(err) => {
+                eprintln!("failed to read config for reload: {err:#}");
+                return;
+            }
+        };
+        if raw == *current_raw {
+            return;
+        }
+
+        let new_cfg = match parse_config_bytes(&raw, self.store.path()) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                eprintln!("config changed but could not be loaded; keeping current listeners: {err:#}");
+                *current_raw = raw;
+                return;
+            }
+        };
+
+        println!("config changed, restarting listeners");
+        let previous_cfg = current_cfg.clone();
+        let previous_active = std::mem::take(active);
+        previous_active.stop().await;
+
+        match self.start_listener_set(&new_cfg).await {
+            Ok(new_active) => {
+                *active = new_active;
+                *current_cfg = new_cfg;
+                *current_raw = raw;
+            }
+            Err(err) => {
+                eprintln!("failed to restart listeners from updated config: {err:#}");
+                match self.start_listener_set(&previous_cfg).await {
+                    Ok(restored) => {
+                        *active = restored;
+                    }
+                    Err(restore_err) => {
+                        eprintln!("failed to restore previous listeners: {restore_err:#}");
+                    }
+                }
+                *current_cfg = previous_cfg;
+                *current_raw = raw;
+            }
+        }
+    }
+
+    async fn start_listener_set(&self, cfg: &ConfigFile) -> anyhow::Result<ActiveListeners> {
+        let host_key_path = resolve_host_key_path(self.store.path(), cfg.host_key.as_deref())?;
+        let host_key = load_or_generate_host_key(&host_key_path).await?;
+        let authz = Arc::new(Authz::load(cfg.authorized_keys.as_deref()).await?);
+        let docker = DockerBackend::from_env_or_config(cfg)?;
+
+        if cfg.mappings.is_empty() {
+            println!("no mappings configured in {}", self.store.path().display());
+            return Ok(ActiveListeners::default());
+        }
+
+        let mut bound = Vec::new();
+        for mapping in &cfg.mappings {
             let port = mapping.port;
-            let server = PortServer::new(mapping, self.docker.clone(), authz.clone());
+            let server = PortServer::new(mapping.clone(), docker.clone(), authz.clone());
             let listeners = build_listeners(&cfg.listen_host, port)?;
 
             for (listen_label, listener) in listeners {
-                let mut task_server = server.clone();
-                let server_config = Arc::new(server::Config {
-                    inactivity_timeout: Some(Duration::from_secs(3600)),
-                    auth_rejection_time: Duration::from_secs(1),
-                    auth_rejection_time_initial: Some(Duration::from_secs(0)),
-                    keys: vec![host_key.clone()],
-                    ..Default::default()
-                });
-
-                println!("listening on {listen_label} -> {}", server.mapping.container);
-                handles.push(tokio::spawn(async move {
-                    task_server
-                        .run_on_socket(server_config, &listener)
-                        .await
-                        .map_err(anyhow::Error::from)
-                }));
+                bound.push((server.clone(), listen_label, listener));
             }
         }
 
-        wait_for_shutdown_signal().await?;
-        for handle in handles {
-            handle.abort();
+        let mut handles = Vec::new();
+        for (server, listen_label, listener) in bound {
+            let mut task_server = server.clone();
+            let server_config = Arc::new(server::Config {
+                inactivity_timeout: Some(Duration::from_secs(3600)),
+                auth_rejection_time: Duration::from_secs(1),
+                auth_rejection_time_initial: Some(Duration::from_secs(0)),
+                keys: vec![host_key.clone()],
+                ..Default::default()
+            });
+
+            println!("listening on {listen_label} -> {}", server.mapping.container);
+            handles.push(tokio::spawn(async move {
+                task_server
+                    .run_on_socket(server_config, &listener)
+                    .await
+                    .map_err(anyhow::Error::from)
+            }));
         }
-        let _ = fs::remove_file(&pid_path).await;
-        Ok(())
+        Ok(ActiveListeners { handles })
     }
 
     pub async fn stop_daemon(store: &ConfigStore) -> anyhow::Result<()> {
@@ -185,6 +277,26 @@ impl ServeManager {
         println!("sent SIGTERM to daemon pid {pid}");
         Ok(())
     }
+}
+
+#[derive(Default)]
+struct ActiveListeners {
+    handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
+}
+
+impl ActiveListeners {
+    async fn stop(self) {
+        for handle in self.handles {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+fn parse_config_bytes(raw: &[u8], path: &Path) -> anyhow::Result<ConfigFile> {
+    let raw = std::str::from_utf8(raw)
+        .with_context(|| format!("invalid UTF-8 in {}", path.display()))?;
+    toml::from_str(raw).with_context(|| format!("invalid TOML: {}", path.display()))
 }
 
 async fn ensure_daemon_not_running(pid_path: &Path) -> anyhow::Result<()> {
@@ -1287,6 +1399,7 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use tokio::net::UnixListener;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::oneshot;
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1395,6 +1508,67 @@ exit 4
         (addr, tmp)
     }
 
+    fn unused_local_port() -> u16 {
+        TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn write_serve_config(
+        path: &Path,
+        docker_socket: &Path,
+        host_key: &Path,
+        port: u16,
+        container: &str,
+    ) {
+        std::fs::write(
+            path,
+            format!(
+                r#"listen_host = "127.0.0.1"
+docker_socket = "{}"
+host_key = "{}"
+
+[[mappings]]
+port = {}
+container = "{}"
+"#,
+                docker_socket.display(),
+                host_key.display(),
+                port,
+                container
+            ),
+        )
+        .unwrap();
+    }
+
+    async fn wait_for_tcp_connect(port: u16) {
+        tokio::time::timeout(Duration::from_secs(5), async move {
+            loop {
+                if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for 127.0.0.1:{port} to accept TCP"));
+    }
+
+    async fn wait_for_tcp_closed(port: u16) {
+        tokio::time::timeout(Duration::from_secs(5), async move {
+            loop {
+                if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for 127.0.0.1:{port} to close"));
+    }
+
     async fn connect_test_client(addr: std::net::SocketAddr) -> russh::client::Handle<Client> {
         let config = Arc::new(russh::client::Config::default());
         let mut session = russh::client::connect(config, addr, Client {}).await.unwrap();
@@ -1478,6 +1652,117 @@ exit 4
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn foreground_server_reloads_when_config_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let docker_sock = tmp.path().join("unused.sock");
+        let host_key = tmp.path().join("host_key_ed25519");
+        let first_port = unused_local_port();
+        let second_port = unused_local_port();
+        write_serve_config(&config_path, &docker_sock, &host_key, first_port, "first-container");
+
+        let store = ConfigStore::load_or_create(Some(config_path.clone())).await.unwrap();
+        let manager = ServeManager::new(store, DockerBackend::from_socket_path(docker_sock.clone()));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            manager
+                .run_foreground_until_shutdown(
+                    async move {
+                        let _ = shutdown_rx.await;
+                        Ok(())
+                    },
+                    Duration::from_millis(50),
+                )
+                .await
+        });
+
+        wait_for_tcp_connect(first_port).await;
+        write_serve_config(&config_path, &docker_sock, &host_key, second_port, "second-container");
+        wait_for_tcp_connect(second_port).await;
+        wait_for_tcp_closed(first_port).await;
+
+        let _ = shutdown_tx.send(());
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn foreground_server_stays_alive_until_empty_config_gets_mapping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let docker_sock = tmp.path().join("unused.sock");
+        let host_key = tmp.path().join("host_key_ed25519");
+        let port = unused_local_port();
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"listen_host = "127.0.0.1"
+docker_socket = "{}"
+host_key = "{}"
+"#,
+                docker_sock.display(),
+                host_key.display()
+            ),
+        )
+        .unwrap();
+
+        let store = ConfigStore::load_or_create(Some(config_path.clone())).await.unwrap();
+        let manager = ServeManager::new(store, DockerBackend::from_socket_path(docker_sock.clone()));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            manager
+                .run_foreground_until_shutdown(
+                    async move {
+                        let _ = shutdown_rx.await;
+                        Ok(())
+                    },
+                    Duration::from_millis(50),
+                )
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err());
+        write_serve_config(&config_path, &docker_sock, &host_key, port, "new-container");
+        wait_for_tcp_connect(port).await;
+
+        let _ = shutdown_tx.send(());
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn foreground_server_keeps_current_listeners_when_updated_config_is_invalid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let docker_sock = tmp.path().join("unused.sock");
+        let host_key = tmp.path().join("host_key_ed25519");
+        let port = unused_local_port();
+        write_serve_config(&config_path, &docker_sock, &host_key, port, "stable-container");
+
+        let store = ConfigStore::load_or_create(Some(config_path.clone())).await.unwrap();
+        let manager = ServeManager::new(store, DockerBackend::from_socket_path(docker_sock.clone()));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            manager
+                .run_foreground_until_shutdown(
+                    async move {
+                        let _ = shutdown_rx.await;
+                        Ok(())
+                    },
+                    Duration::from_millis(50),
+                )
+                .await
+        });
+
+        wait_for_tcp_connect(port).await;
+        std::fs::write(&config_path, "not valid toml = [").unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        wait_for_tcp_connect(port).await;
+
+        let _ = shutdown_tx.send(());
+        server.await.unwrap().unwrap();
     }
 
     #[cfg(target_os = "linux")]

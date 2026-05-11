@@ -175,6 +175,7 @@ docker2ssh --config /etc/d2s/config.toml stop
 - 除非你的运行用户已经在 Docker group 中，否则需要访问 `/var/run/docker.sock`
 - 绑定 `2222` 这种高位端口通常不需要 root
 - daemon 的 pid 文件会写在配置文件同目录，文件名是 `d2s.pid`
+- 前台 daemon 会监听配置文件变化，并在映射更新后自动重启监听端口
 
 ## Python 包
 

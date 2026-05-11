@@ -175,6 +175,7 @@ Notes:
 - Access to `/var/run/docker.sock` is required unless you run with a user in the Docker group.
 - Binding high ports like `2222` does not require root.
 - The daemon pid file is written next to the config file as `d2s.pid`.
+- The foreground daemon watches the config file and restarts listeners automatically when mappings change.
 
 ## Python Package
 
