@@ -616,6 +616,38 @@ impl server::Handler for PortHandler {
         }
         Ok(())
     }
+
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        name: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if name != "sftp" {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
+
+        let Some(state) = self.channels.remove(&channel) else {
+            bail!("missing channel state for subsystem request");
+        };
+        let mapping = self.mapping.clone();
+        let sftp_server = match resolve_container_sftp_server(&mapping).await {
+            Ok(path) => path,
+            Err(err) => {
+                eprintln!("sftp subsystem rejected: {err:#}");
+                session.channel_failure(channel)?;
+                return Ok(());
+            }
+        };
+        session.channel_success(channel)?;
+        tokio::spawn(async move {
+            if let Err(err) = spawn_container_sftp(state.channel, mapping, sftp_server).await {
+                eprintln!("sftp task ended with error: {err:#}");
+            }
+        });
+        Ok(())
+    }
 }
 
 async fn spawn_container_shell(
@@ -671,6 +703,12 @@ async fn spawn_container_exec(
     ));
     // #endregion
     run_attached_process(channel, cmd, pty).await
+}
+
+async fn spawn_container_sftp(channel: Channel<Msg>, mapping: MappingSpec, sftp_server: String) -> anyhow::Result<()> {
+    let mut cmd = docker_exec_base_command(&mapping.container, false);
+    cmd.arg(sftp_server);
+    run_attached_process(channel, cmd, None).await
 }
 
 async fn connect_direct_tcpip_target(
@@ -788,6 +826,38 @@ async fn validate_shell_candidate(container: &str, shell: &str) -> anyhow::Resul
     } else {
         bail!("shell probe failed for {shell}");
     }
+}
+
+async fn resolve_container_sftp_server(mapping: &MappingSpec) -> anyhow::Result<String> {
+    let shell = resolve_container_shell(mapping).await?;
+    let probe = r#"for p in /usr/lib/openssh/sftp-server /usr/lib/ssh/sftp-server /usr/libexec/openssh/sftp-server /usr/libexec/sftp-server; do [ -x "$p" ] && { printf '%s\n' "$p"; exit 0; }; done; command -v sftp-server || exit 1"#;
+    let mut cmd = docker_exec_base_command(&mapping.container, false);
+    cmd.arg(shell).arg("-c").arg(probe);
+    let output = cmd.output().await.with_context(|| {
+        format!(
+            "failed to probe sftp-server in container {}",
+            mapping.container
+        )
+    })?;
+
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !path.is_empty() {
+            return Ok(path);
+        }
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!(
+        "could not determine sftp-server for container {}; install openssh-sftp-server or use legacy scp mode (-O): {}",
+        mapping.container,
+        stderr.trim()
+    )
 }
 
 fn docker_exec_base_command(container: &str, pty_requested: bool) -> Command {
@@ -1259,9 +1329,22 @@ if [ "$1" = "/bin/bash" ] || [ "$1" = "/bin/sh" ] || [ "$1" = "sh" ]; then
   fi
   if [ "$1" = "-c" ]; then
     shift
+    case "$1" in
+      *sftp-server*)
+        echo /usr/lib/openssh/sftp-server
+        exit 0
+        ;;
+    esac
     /bin/sh -lc "$1"
     exit $?
   fi
+fi
+if [ "$1" = "/usr/lib/openssh/sftp-server" ]; then
+  if [ -n "$D2S_TEST_SFTP_MARKER" ]; then
+    printf sftp-started > "$D2S_TEST_SFTP_MARKER"
+  fi
+  cat >/dev/null
+  exit 0
 fi
 if [ "$1" = "sh" ] && [ $# -eq 1 ]; then
   cat
@@ -1532,6 +1615,33 @@ exit 4
         assert!(out.is_empty() || !String::from_utf8_lossy(&out).contains("the input device is not a TTY"));
         unsafe {
             std::env::remove_var("D2S_DOCKER_BIN");
+        }
+    }
+
+    #[tokio::test]
+    async fn sftp_subsystem_attaches_to_container_sftp_server() {
+        let _guard = env_lock().lock().unwrap();
+        let (addr, tmp) = spawn_test_server(None).await;
+        let session = connect_test_client(addr).await;
+        let channel = session.channel_open_session().await.unwrap();
+
+        unsafe {
+            std::env::set_var("D2S_TEST_SFTP_MARKER", tmp.path().join("sftp.started"));
+        }
+        channel.request_subsystem(true, "sftp").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if tokio::fs::metadata(tmp.path().join("sftp.started")).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("sftp subsystem did not start container sftp server");
+        unsafe {
+            std::env::remove_var("D2S_DOCKER_BIN");
+            std::env::remove_var("D2S_TEST_SFTP_MARKER");
         }
     }
 
