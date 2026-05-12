@@ -86,6 +86,7 @@ docker2ssh show
 docker2ssh doctor --host 127.0.0.1 --user docker [--identity /path/to/id_ed25519]
 docker2ssh serve
 docker2ssh stop
+docker2ssh upgrade
 ```
 
 说明：
@@ -95,6 +96,7 @@ docker2ssh stop
 - `show` 只输出当前容器正在运行的映射
 - `serve` 会启动后台 daemon，并在配置文件旁边写入 pid 文件
 - `stop` 会停止同一配置路径下启动的 daemon
+- `upgrade` 会执行 `python3 -m pip install -U docker2ssh`，更新 PyPI 包和内置运行时
 
 ## 配置文件
 
@@ -159,6 +161,18 @@ DOCKER_HOST=ssh://docker@your-server:2222 docker cp ./file.txt my-app:/tmp/file.
 docker2ssh stop
 ```
 
+从 PyPI 升级 docker2ssh：
+
+```bash
+docker2ssh upgrade
+```
+
+如果需要指定 Python 解释器：
+
+```bash
+PYTHON=/path/to/python docker2ssh upgrade
+```
+
 ## Daemon 用法
 
 `docker2ssh serve` 会自动后台化，普通场景下不需要再额外接一个服务管理器。
@@ -189,7 +203,7 @@ docker2ssh --config /etc/d2s/config.toml stop
 
 - `docker2ssh` 命令行脚本
 - 一个会调用内置 `d2s` 二进制的小型 Python API
-- `D2S` 方法：`serve`、`show`、`doctor`、`config set/rm/list`
+- `D2S` 方法：`serve`、`upgrade`、`show`、`doctor`、`config set/rm/list`
 - 每个已发布 wheel 中都内置一个 `d2s` 二进制
 
 在先构建静态二进制之后，可以这样构建预编译 wheel：

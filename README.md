@@ -86,6 +86,7 @@ docker2ssh show
 docker2ssh doctor --host 127.0.0.1 --user docker [--identity /path/to/id_ed25519]
 docker2ssh serve
 docker2ssh stop
+docker2ssh upgrade
 ```
 
 Notes:
@@ -95,6 +96,7 @@ Notes:
 - `show` only prints mappings whose container is currently running.
 - `serve` starts a background daemon and writes a pid file next to the config file.
 - `stop` stops the daemon started from the same config path.
+- `upgrade` runs `python3 -m pip install -U docker2ssh` to update the PyPI package and bundled runtime.
 
 ## Config File
 
@@ -159,6 +161,18 @@ Stop it later:
 docker2ssh stop
 ```
 
+Upgrade docker2ssh from PyPI:
+
+```bash
+docker2ssh upgrade
+```
+
+If you need a specific Python interpreter:
+
+```bash
+PYTHON=/path/to/python docker2ssh upgrade
+```
+
 ## Daemon Usage
 
 `docker2ssh serve` already detaches into the background, so you can run it directly without an external service manager for the normal case.
@@ -189,7 +203,7 @@ What it provides:
 
 - a `docker2ssh` console script
 - a small Python API that shells out to the `d2s` binary
-- `D2S` methods for `serve`, `show`, `doctor`, `config set/rm/list`
+- `D2S` methods for `serve`, `upgrade`, `show`, `doctor`, `config set/rm/list`
 - a bundled `d2s` binary inside each published wheel
 
 Build a precompiled wheel after producing the static binary:

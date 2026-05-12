@@ -45,4 +45,5 @@ docker2ssh show
 docker2ssh config set 2222 my-container
 docker2ssh serve
 docker2ssh stop
+docker2ssh upgrade
 ```

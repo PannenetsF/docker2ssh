@@ -73,6 +73,9 @@ class D2S:
     def serve(self, *, check: bool = True) -> subprocess.CompletedProcess[str]:
         return self.run("serve", check=check)
 
+    def upgrade(self, *, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return self.run("upgrade", check=check)
+
     def show(self) -> str:
         return self.run("show").stdout
 

@@ -4,6 +4,7 @@ use crate::ssh_server::ServeManager;
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use tokio::process::Command;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -54,6 +55,43 @@ pub enum Cmd {
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
     },
+
+    /// Upgrade docker2ssh from PyPI with pip.
+    Upgrade,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct UpgradeCommand {
+    program: String,
+    args: [&'static str; 5],
+}
+
+fn upgrade_command(python_override: Option<&str>) -> UpgradeCommand {
+    UpgradeCommand {
+        program: python_override
+            .map(str::to_owned)
+            .or_else(|| std::env::var("PYTHON").ok())
+            .unwrap_or_else(|| "python3".to_owned()),
+        args: ["-m", "pip", "install", "-U", "docker2ssh"],
+    }
+}
+
+async fn run_upgrade() -> anyhow::Result<()> {
+    let upgrade = upgrade_command(None);
+    println!(
+        "running: {} {}",
+        upgrade.program,
+        upgrade.args.join(" ")
+    );
+    let status = Command::new(&upgrade.program)
+        .args(upgrade.args)
+        .status()
+        .await
+        .with_context(|| format!("failed to run {}", upgrade.program))?;
+    if !status.success() {
+        anyhow::bail!("upgrade failed with status {status}");
+    }
+    Ok(())
 }
 
 #[derive(Subcommand, Debug)]
@@ -77,6 +115,10 @@ pub enum ConfigCmd {
 
 impl Cli {
     pub async fn run(self) -> anyhow::Result<()> {
+        if matches!(&self.cmd, Some(Cmd::Upgrade)) {
+            return run_upgrade().await;
+        }
+
         let store = ConfigStore::load_or_create(self.config.clone()).await?;
 
         match self.cmd.unwrap_or(Cmd::Serve { foreground: false }) {
@@ -152,8 +194,30 @@ impl Cli {
                 let active = docker.active_mappings(&cfg.mappings).await?;
                 crate::ssh_server::doctor::run(&active, &host, &user, identity.as_deref()).await?;
             }
+            Cmd::Upgrade => unreachable!("upgrade is handled before config loading"),
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upgrade_command_defaults_to_python3_pip_install_upgrade() {
+        let command = upgrade_command(None);
+
+        assert_eq!(command.program, "python3");
+        assert_eq!(command.args, ["-m", "pip", "install", "-U", "docker2ssh"]);
+    }
+
+    #[test]
+    fn upgrade_command_accepts_python_override() {
+        let command = upgrade_command(Some("/opt/python/bin/python"));
+
+        assert_eq!(command.program, "/opt/python/bin/python");
+        assert_eq!(command.args, ["-m", "pip", "install", "-U", "docker2ssh"]);
     }
 }
